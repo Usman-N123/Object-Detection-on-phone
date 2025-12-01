@@ -1,135 +1,205 @@
 <!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Local Object Detection</title>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>AI Vision HUD</title>
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
     <style>
-      body {
-        margin: 0;
-        padding: 0;
-        font-family: sans-serif;
-        background: black;
-      }
-      video {
-        position: absolute;
-        top: 0;
-        left: 0;
-        z-index: 1;
-        width: 100%;
-        height: 100%;
-        object-fit: cover;
-      }
-      canvas {
-        position: absolute;
-        top: 0;
-        left: 0;
-        z-index: 2;
-        width: 100%;
-        height: 100%;
-      }
-      #status {
-        position: absolute;
-        top: 10px;
-        left: 10px;
-        z-index: 3;
-        color: white;
-        background: rgba(0, 0, 0, 0.7);
-        padding: 10px;
-        border-radius: 5px;
-        font-size: 16px;
-      }
+        /* --- 1. THE "CYBERPUNK" VISUAL STYLE --- */
+        body { 
+            margin: 0; 
+            overflow: hidden; 
+            background: #000; 
+            font-family: 'Courier New', Courier, monospace; 
+        }
+
+        /* Fullscreen Video */
+        video {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100vw; height: 100vh;
+            object-fit: cover;
+            z-index: 1;
+            filter: contrast(1.1) brightness(1.1); /* Slight pop */
+        }
+
+        /* The Drawing Canvas */
+        canvas {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100vw; height: 100vh;
+            z-index: 2;
+        }
+
+        /* The Scanline Overlay Effect */
+        .scanlines {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            z-index: 3;
+            background: linear-gradient(
+                to bottom,
+                rgba(255,255,255,0),
+                rgba(255,255,255,0) 50%,
+                rgba(0,0,0,0.2) 50%,
+                rgba(0,0,0,0.2)
+            );
+            background-size: 100% 4px;
+            pointer-events: none; /* Let clicks pass through */
+        }
+
+        /* UI Overlay - Top Header */
+        #header {
+            position: absolute;
+            top: 20px; left: 20px;
+            z-index: 4;
+            color: #00ffcc;
+            text-shadow: 0 0 5px #00ffcc;
+            font-size: 14px;
+            letter-spacing: 2px;
+        }
+
+        /* UI Overlay - Loading Spinner */
+        #loader {
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 5;
+            color: #00ffcc;
+            font-size: 24px;
+            text-align: center;
+            animation: pulse 1s infinite;
+        }
+        
+        @keyframes pulse {
+            0% { opacity: 0.5; }
+            50% { opacity: 1; }
+            100% { opacity: 0.5; }
+        }
     </style>
-  </head>
-  <body>
-    <div id="status">Loading Model... Please wait.</div>
+</head>
+<body>
+    <div class="scanlines"></div>
+    <div id="header">
+        SYSTEM: ONLINE<br>
+        MODE: OBJECT_DETECTION<br>
+        <span id="fps">FPS: 0</span>
+    </div>
+    <div id="loader">INITIALIZING NEURAL NET...</div>
+    
     <video id="webcam" playsinline autoplay muted></video>
     <canvas id="canvas"></canvas>
 
     <script>
-      const video = document.getElementById("webcam");
-      const canvas = document.getElementById("canvas");
-      const ctx = canvas.getContext("2d");
-      const status = document.getElementById("status");
-      let model;
+        const video = document.getElementById('webcam');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const loader = document.getElementById('loader');
+        const fpsElem = document.getElementById('fps');
+        
+        let model;
+        let lastFrameTime = 0;
+        
+        // "Smoothness" variables (Linear Interpolation)
+        let detectedObjects = []; 
 
-      // 1. Setup Camera
-      async function setupCamera() {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: false,
-          video: {
-            facingMode: "environment", // Forces back camera
-          },
-        });
-        video.srcObject = stream;
+        // Sound Effect (Web Audio API)
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        function playBeep() {
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(880, audioCtx.currentTime); // High pitch beep
+            gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+            osc.start();
+            osc.stop(audioCtx.currentTime + 0.1);
+        }
 
-        return new Promise((resolve) => {
-          video.onloadedmetadata = () => {
-            resolve(video);
-          };
-        });
-      }
+        async function setupCamera() {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: false,
+                video: { facingMode: 'environment' }
+            });
+            video.srcObject = stream;
+            return new Promise(resolve => video.onloadedmetadata = () => resolve(video));
+        }
 
-      // 2. Load Model & Start Detection
-      async function main() {
-        // Load the COCO-SSD model (Pre-trained)
-        model = await cocoSsd.load();
-        status.innerText = "Model Loaded. Starting Camera...";
+        async function main() {
+            model = await cocoSsd.load();
+            loader.style.display = 'none'; // Hide loader
+            await setupCamera();
+            video.play();
 
-        await setupCamera();
-        video.play();
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
 
-        // Set canvas size to match video
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
+            detectFrame();
+        }
 
-        status.innerText = "Running Detection...";
-        detectFrame();
-      }
+        async function detectFrame() {
+            // 1. Calculate FPS
+            const now = performance.now();
+            const fps = Math.round(1000 / (now - lastFrameTime));
+            lastFrameTime = now;
+            fpsElem.innerText = `FPS: ${fps}`;
 
-      // 3. Real-time Detection Loop
-      async function detectFrame() {
-        const predictions = await model.detect(video);
+            // 2. Detect Objects
+            const predictions = await model.detect(video);
+            
+            // 3. Clear Canvas
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            // 4. Scaling Factors (Video vs Screen size)
+            const scaleX = canvas.width / video.videoWidth;
+            const scaleY = canvas.height / video.videoHeight;
 
-        // Clear previous drawings
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
+            // 5. Draw "High Tech" Box
+            predictions.forEach(prediction => {
+                const [x, y, width, height] = prediction.bbox;
+                const label = prediction.class.toUpperCase();
+                
+                // Scale to screen
+                const sx = x * scaleX;
+                const sy = y * scaleY;
+                const sw = width * scaleX;
+                const sh = height * scaleY;
 
-        // Scale if the video is displayed differently than its resolution
-        const scaleX = canvas.width / video.videoWidth;
-        const scaleY = canvas.height / video.videoHeight;
+                // Color based on confidence
+                const color = prediction.score > 0.7 ? '#00FF00' : '#00FFFF'; // Green or Cyan
 
-        predictions.forEach((prediction) => {
-          const [x, y, width, height] = prediction["bbox"];
-          const text = prediction["class"];
-          const score = Math.round(prediction["score"] * 100) + "%";
+                // Draw Corners only (Futuristic Look)
+                const lineLen = 20;
+                ctx.lineWidth = 4;
+                ctx.strokeStyle = color;
+                
+                // Top-Left
+                ctx.beginPath(); ctx.moveTo(sx, sy + lineLen); ctx.lineTo(sx, sy); ctx.lineTo(sx + lineLen, sy); ctx.stroke();
+                // Top-Right
+                ctx.beginPath(); ctx.moveTo(sx + sw - lineLen, sy); ctx.lineTo(sx + sw, sy); ctx.lineTo(sx + sw, sy + lineLen); ctx.stroke();
+                // Bottom-Left
+                ctx.beginPath(); ctx.moveTo(sx, sy + sh - lineLen); ctx.lineTo(sx, sy + sh); ctx.lineTo(sx + lineLen, sy + sh); ctx.stroke();
+                // Bottom-Right
+                ctx.beginPath(); ctx.moveTo(sx + sw - lineLen, sy + sh); ctx.lineTo(sx + sw, sy + sh); ctx.lineTo(sx + sw, sy + sh - lineLen); ctx.stroke();
 
-          // Draw Box
-          ctx.strokeStyle = "#00FFFF";
-          ctx.lineWidth = 4;
-          ctx.strokeRect(
-            x * scaleX,
-            y * scaleY,
-            width * scaleX,
-            height * scaleY
-          );
+                // Draw Text Label with Background
+                ctx.fillStyle = color;
+                ctx.globalAlpha = 0.2;
+                ctx.fillRect(sx, sy - 25, ctx.measureText(label).width + 10, 25);
+                ctx.globalAlpha = 1.0;
+                ctx.font = '16px Courier New';
+                ctx.fillText(label, sx + 5, sy - 7);
 
-          // Draw Label
-          ctx.fillStyle = "#00FFFF";
-          ctx.font = "24px Arial";
-          ctx.fillText(
-            text + " " + score,
-            x * scaleX,
-            y * scaleY > 10 ? y * scaleY - 5 : 10
-          );
-        });
+            });
 
-        // Loop forever
-        requestAnimationFrame(detectFrame);
-      }
+            requestAnimationFrame(detectFrame);
+        }
 
-      main();
+        main();
     </script>
-  </body>
+</body>
 </html>
